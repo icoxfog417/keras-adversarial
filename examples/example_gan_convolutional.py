@@ -1,3 +1,4 @@
+import os
 import matplotlib as mpl
 
 # This line allows mpl to run with no DISPLAY defined
@@ -7,6 +8,7 @@ from keras.layers import Flatten, Dropout, LeakyReLU, Input, Activation
 from keras.models import Model
 from keras.layers.convolutional import UpSampling2D
 from keras.optimizers import Adam
+from keras.callbacks import TensorBoard
 from keras.datasets import mnist
 import pandas as pd
 import numpy as np
@@ -16,10 +18,6 @@ from keras_adversarial.image_grid_callback import ImageGridCallback
 from keras_adversarial import AdversarialModel, simple_gan, gan_targets
 from keras_adversarial import AdversarialOptimizerSimultaneous, normal_latent_sampling
 from image_utils import dim_ordering_fix, dim_ordering_input, dim_ordering_reshape, dim_ordering_unfix
-
-
-def leaky_relu(x):
-    return K.relu(x, 0.2)
 
 
 def model_generator():
@@ -78,16 +76,16 @@ def generator_sampler(latent_dim, generator):
     return fun
 
 
-if __name__ == "__main__":
-    # z \in R^100
-    latent_dim = 100
-    # x \in R^{28x28}
-    input_shape = (1, 28, 28)
+def gan_convolutional(
+        adversarial_optimizer, path, opt_g, opt_d, nb_epoch,
+        generator, discriminator,
+        input_shape=(1, 28, 28), latent_dim=100):
 
-    # generator (z -> x)
-    generator = model_generator()
-    # discriminator (x -> y)
-    discriminator = model_discriminator(input_shape=input_shape)
+    csvpath = os.path.join(path, "history.csv")
+    if os.path.exists(csvpath):
+        print("Already exists: {}".format(csvpath))
+        return
+
     # gan (x - > yfake, yreal), z generated on GPU
     gan = simple_gan(generator, discriminator, normal_latent_sampling((latent_dim,)))
 
@@ -100,23 +98,62 @@ if __name__ == "__main__":
     model = AdversarialModel(base_model=gan,
                              player_params=[generator.trainable_weights, discriminator.trainable_weights],
                              player_names=["generator", "discriminator"])
-    model.adversarial_compile(adversarial_optimizer=AdversarialOptimizerSimultaneous(),
-                              player_optimizers=[Adam(1e-4, decay=1e-4), Adam(1e-3, decay=1e-4)],
-                              loss='binary_crossentropy')
 
-    # train model
-    generator_cb = ImageGridCallback("output/gan_convolutional/epoch-{:03d}.png",
+    model.adversarial_compile(adversarial_optimizer=adversarial_optimizer,
+                              player_optimizers=[opt_g, opt_d],
+                              loss="binary_crossentropy")
+
+    # create callback to generate images
+    os.path.join(path, "epoch-{:03d}.png")
+    generator_cb = ImageGridCallback(os.path.join(path, "epoch-{:03d}.png"),
                                      generator_sampler(latent_dim, generator))
 
+    callbacks = [generator_cb]
+    if K.backend() == "tensorflow":
+        callbacks.append(
+            TensorBoard(log_dir=os.path.join(path, "logs"),
+                        histogram_freq=0, write_graph=True, write_images=True))
+
+    # train model
     xtrain, xtest = mnist_data()
-    xtrain = dim_ordering_fix(xtrain.reshape((-1, 1, 28, 28)))
-    xtest = dim_ordering_fix(xtest.reshape((-1, 1, 28, 28)))
+    xtrain = dim_ordering_fix(xtrain.reshape((-1,) + input_shape))
+    xtest = dim_ordering_fix(xtest.reshape((-1,) + input_shape))
     y = gan_targets(xtrain.shape[0])
     ytest = gan_targets(xtest.shape[0])
-    history = model.fit(x=xtrain, y=y, validation_data=(xtest, ytest), callbacks=[generator_cb], nb_epoch=100,
+
+    history = model.fit(x=xtrain, y=y, validation_data=(xtest, ytest),
+                        callbacks=callbacks, nb_epoch=nb_epoch,
                         batch_size=32)
     df = pd.DataFrame(history.history)
-    df.to_csv("output/gan_convolutional/history.csv")
+    df.to_csv(csvpath)
 
-    generator.save("output/gan_convolutional/generator.h5")
-    discriminator.save("output/gan_convolutional/discriminator.h5")
+    # save models
+    generator.save(os.path.join(path, "generator.h5"))
+    discriminator.save(os.path.join(path, "discriminator.h5"))
+
+
+def main():
+    # z \in R^100
+    latent_dim = 100
+
+    # x \in R^{28x28}
+    input_shape = (1, 28, 28)
+
+    # generator (z -> x)
+    generator = model_generator()
+
+    # discriminator (x -> y)
+    discriminator = model_discriminator(input_shape=input_shape)
+
+    gan_convolutional(AdversarialOptimizerSimultaneous(),
+                      "output/gan_convolutional",
+                      opt_g=Adam(1e-4, decay=1e-4),
+                      opt_d=Adam(1e-3, decay=1e-4),
+                      nb_epoch=100,
+                      generator=generator, discriminator=discriminator,
+                      input_shape=input_shape,
+                      latent_dim=latent_dim)
+
+
+if __name__ == "__main__":
+    main()
